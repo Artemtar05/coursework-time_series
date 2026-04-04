@@ -136,7 +136,7 @@ def forecast(df, holiday_series,
             'y_daily': fcst_daily.values().flatten()
         })
 
-        # ==== ДЕЗАГРЕГАЦИЯ В 30 МИН ====
+        # Дезагрегция в 30 минут
         future_index = pd.date_range(
             start=series_daily.end_time() + pd.Timedelta(minutes=30),
             periods=steps_days * 48,
