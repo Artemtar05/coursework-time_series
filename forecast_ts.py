@@ -389,6 +389,7 @@ def save_plots(df, forecast_df, output_dir):
 
     for ts_name in forecast_df['ts_name'].unique():
 
+
         df_hist = df[df['ts_name'] == ts_name]
         df_fcst = forecast_df[forecast_df['ts_name'] == ts_name]
 
