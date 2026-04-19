@@ -7,11 +7,22 @@ from dataclasses import dataclass
 from darts import TimeSeries
 from darts.models import Prophet
 import holidays
+import optuna
+import logging
+
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
+logger = logging.getLogger(__name__)
+
 
 app = typer.Typer()
 
 
-# ================= CONFIG =================
+
 @dataclass
 class Config:
     steps_days: int = 7
@@ -20,7 +31,7 @@ class Config:
     use_params_tuning: bool = False
 
 
-# ================= DATA =================
+
 def load_data(file_path):
     ext = os.path.splitext(file_path)[1].lower()
 
@@ -32,14 +43,46 @@ def load_data(file_path):
         raise ValueError("Only CSV and XLSX are supported")
 
 
-# ================= METRICS =================
+
 def calculate_metrics(y_true, y_pred):
     mape = np.mean(np.abs((y_true - y_pred) / (y_true + 1e-9))) * 100
     wape = np.sum(np.abs(y_true - y_pred)) / np.sum(y_true) * 100
     return mape, wape
 
 
-# ================= PREPROCESS =================
+def objective(trial, series, holidays, config):
+
+    params = {
+        "seasonality_mode": trial.suggest_categorical("seasonality_mode", ["additive", "multiplicative"]),
+        "changepoint_prior_scale": trial.suggest_float("changepoint_prior_scale", 0.001, 0.5),
+        "seasonality_prior_scale": trial.suggest_float("seasonality_prior_scale", 0.01, 10),
+    }
+
+    model = Prophet(
+        yearly_seasonality=False,
+        weekly_seasonality=True,
+        **params
+    )
+
+    horizon = config.steps_days
+
+    train = series[:-horizon]
+    val = series[-horizon:]
+
+    holidays_train = holidays[:len(train)]
+    holidays_val = holidays[len(train):]
+
+    model.fit(train, future_covariates=holidays_train)
+    pred = model.predict(n=horizon, future_covariates=holidays_val)
+
+    y_true = val.values().flatten()
+    y_pred = pred.values().flatten()
+
+    _, wape = calculate_metrics(y_true, y_pred)
+
+    return wape
+
+
 def preprocess(df, config: Config):
     df = df.copy()
     df['dttm_30'] = pd.to_datetime(df['dttm_30'])
@@ -50,13 +93,21 @@ def preprocess(df, config: Config):
 
         recent_data = df_history[df_history['dttm_30'] > start_date].copy()
         recent_data['time'] = recent_data['dttm_30'].dt.time
+        recent_data['is_weekend'] = recent_data['dttm_30'].dt.weekday >= 5
 
-        profile = recent_data.groupby('time')['y'].mean().reset_index()
+        profile = (
+            recent_data
+            .groupby(['is_weekend', 'time'])['y']
+            .mean()
+            .reset_index()
+        )
 
-        total_sum = profile['y'].sum()
-        profile['share'] = profile['y'] / total_sum if total_sum != 0 else 1 / 48
+        # нормализация внутри каждой группы
+        profile['share'] = profile.groupby('is_weekend')['y'].transform(
+            lambda x: x / x.sum() if x.sum() != 0 else 1 / 48
+        )
 
-        return profile[['time', 'share']]
+        return profile[['is_weekend', 'time', 'share']]
 
     def aggregate_to_daily(df):
         daily = df.copy()
@@ -93,21 +144,32 @@ def preprocess(df, config: Config):
     return df, get_intraday_profile, aggregate_to_daily, holiday_series
 
 
-# ================= FORECAST (1) DAILY =================
+
 def forecast_daily(series_daily, holidays_train, future_holidays, config: Config):
+
+    best_params = {}
+
+    if config.use_params_tuning:
+        study = optuna.create_study(direction="minimize")
+
+        study.optimize(
+            lambda trial: objective(trial, series_daily, holidays_train, config),
+            n_trials=20
+        )
+
+        best_params = study.best_params
+    else:
+        best_params = {}
 
     model = Prophet(
         yearly_seasonality=False,
         weekly_seasonality=True,
-        seasonality_mode='multiplicative'
+        **best_params
     )
 
-    # 🔥 тут можно включить тюнинг / CV
-    if config.use_params_tuning:
-        print("⚙️ Params tuning placeholder")
-
     if config.use_crossvalidation:
-        print("📊 Cross-validation placeholder")
+        score = cross_validate(series_daily, holidays_train, config)
+        logger.info(f"CV WAPE: {score}")
 
     model.fit(series_daily, future_covariates=holidays_train)
 
@@ -117,7 +179,6 @@ def forecast_daily(series_daily, holidays_train, future_holidays, config: Config
     )
 
 
-# ================= FORECAST (2) DISAGG =================
 def disaggregate_to_intraday(fcst_daily, profile, start_time, steps_days):
 
     df_fcst_daily = pd.DataFrame({
@@ -134,21 +195,103 @@ def disaggregate_to_intraday(fcst_daily, profile, start_time, steps_days):
     fcst_30 = pd.DataFrame({'dttm_30': future_index})
     fcst_30['date'] = fcst_30['dttm_30'].dt.floor('D')
     fcst_30['time'] = fcst_30['dttm_30'].dt.time
+    fcst_30['is_weekend'] = fcst_30['dttm_30'].dt.weekday >= 5
+
 
     fcst_30 = fcst_30.merge(df_fcst_daily, on='date', how='left')
-    fcst_30 = fcst_30.merge(profile, on='time', how='left')
+
+
+    fcst_30 = fcst_30.merge(profile, on=['is_weekend', 'time'], how='left')
+
 
     fcst_30['forecast'] = fcst_30['y_daily'] * fcst_30['share']
 
     return fcst_30[['dttm_30', 'forecast']]
 
 
-# ================= MAIN FORECAST =================
+def get_new_year_profile(df):
+
+    df['date'] = df['dttm_30'].dt.date
+    daily = df.groupby('date')['y'].sum().reset_index()
+    daily['date'] = pd.to_datetime(daily['date'])
+
+    profiles = []
+
+    for year in [2023, 2024, 2025]:
+        ny_range = pd.date_range(f"{year}-01-01", f"{year}-01-08")
+
+        before = daily[
+            (daily['date'] >= f"{year-1}-12-15") &
+            (daily['date'] < f"{year}-01-01")
+        ]['y'].mean()
+
+        after = daily[
+            (daily['date'] > f"{year}-01-08") &
+            (daily['date'] <= f"{year}-01-20")
+        ]['y'].mean()
+
+        baseline = np.mean([before, after])
+
+        for d in ny_range:
+            val = daily[daily['date'] == d]['y']
+            if len(val) > 0:
+                profiles.append({
+                    "day": d.day,
+                    "coef": val.values[0] / baseline if baseline > 0 else 1
+                })
+
+    profile_df = pd.DataFrame(profiles)
+    return profile_df.groupby('day')['coef'].mean().to_dict()
+
+def apply_new_year_adjustment(fcst_df, ny_profile):
+
+    fcst_df['date'] = fcst_df['dttm_30'].dt.date
+
+    for i, row in fcst_df.iterrows():
+        date = pd.to_datetime(row['date'])
+
+        if date.month == 1 and date.day in ny_profile:
+            fcst_df.loc[i, 'forecast'] *= ny_profile[date.day]
+
+    return fcst_df
+
+
+def cross_validate(series, holidays, config: Config):
+    horizon = config.steps_days
+    stride = 7  # шаг окна
+
+    errors = []
+
+    for i in range(0, len(series) - horizon * 2, stride):
+        train = series[:len(series) - horizon - i]
+        val = series[len(series) - horizon - i: len(series) - i]
+
+        holidays_train = holidays[:len(train)]
+        holidays_val = holidays[len(train):len(train)+horizon]
+
+        model = Prophet(
+            yearly_seasonality=False,
+            weekly_seasonality=True,
+            seasonality_mode='multiplicative'
+        )
+
+        model.fit(train, future_covariates=holidays_train)
+        pred = model.predict(n=horizon, future_covariates=holidays_val)
+
+        y_true = val.values().flatten()
+        y_pred = pred.values().flatten()
+
+        mape, wape = calculate_metrics(y_true, y_pred)
+        errors.append(wape)
+
+    return np.mean(errors)
+
 def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, config):
 
     results = []
 
     for ts_name in df['ts_name'].unique():
+        logger.info(f"Processing TS: {ts_name}")
         ts_df = df[df['ts_name'] == ts_name]
 
         if len(ts_df) < 48 * 14:
@@ -177,7 +320,8 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
             'is_holiday',
             freq='D'
         )
-        # === FUTURE HOLIDAYS (ПРАВИЛЬНО) ===
+
+
         start_date = series_daily.end_time() + pd.Timedelta(days=1)
 
         future_dates = pd.date_range(
@@ -203,7 +347,7 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
             freq='D'
         )
 
-        # === STEP 1 ===
+
         fcst_daily = forecast_daily(
             series_daily,
             holidays_train,
@@ -211,7 +355,7 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
             config
         )
 
-        # === STEP 2 ===
+
         fcst_30 = disaggregate_to_intraday(
             fcst_daily,
             profile,
@@ -219,30 +363,55 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
             config.steps_days
         )
 
+        ny_profile = get_new_year_profile(ts_df)
+        fcst_30 = apply_new_year_adjustment(fcst_30, ny_profile)
+
         fcst_30['ts_name'] = ts_name
         results.append(fcst_30)
 
     return pd.concat(results, ignore_index=True)
 
 
-# ================= OUTPUT =================
+
 def save_forecast(df_forecast, output_dir):
+
     path = os.path.join(output_dir, "forecast.xlsx")
-    df_forecast.to_excel(path, index=False)
-    print(f"Saved: {path}")
+
+    with pd.ExcelWriter(path) as writer:
+        for ts_name in df_forecast['ts_name'].unique():
+            df_ts = df_forecast[df_forecast['ts_name'] == ts_name]
+            df_ts.to_excel(writer, sheet_name=str(ts_name), index=False)
+
+    logger.info(f"Saved: {path}")
 
 
 def save_plots(df, forecast_df, output_dir):
-    fig = go.Figure()
 
-    fig.add_trace(go.Scatter(x=df["dttm_30"], y=df["y"], name="History"))
-    fig.add_trace(go.Scatter(x=forecast_df["dttm_30"], y=forecast_df["forecast"], name="Forecast"))
+    for ts_name in forecast_df['ts_name'].unique():
 
-    path = os.path.join(output_dir, "forecast_plot.html")
-    fig.write_html(path)
+        df_hist = df[df['ts_name'] == ts_name]
+        df_fcst = forecast_df[forecast_df['ts_name'] == ts_name]
+
+        fig = go.Figure()
+
+        fig.add_trace(go.Scatter(
+            x=df_hist["dttm_30"],
+            y=df_hist["y"],
+            name="History"
+        ))
+
+        fig.add_trace(go.Scatter(
+            x=df_fcst["dttm_30"],
+            y=df_fcst["forecast"],
+            name="Forecast"
+        ))
+
+        path = os.path.join(output_dir, f"forecast_plot_{ts_name}.html")
+        fig.write_html(path)
+
+        logger.info(f"Saved plot: {path}")
 
 
-# ================= CLI =================
 @app.command()
 def main(
     file_path: str = typer.Option(..., help="Path to input file"),
@@ -261,7 +430,8 @@ def main(
         use_params_tuning=use_params_tuning
     )
 
-    output_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(os.getcwd(), "outputs")
+    os.makedirs(output_dir, exist_ok=True)
 
     df = load_data(file_path)
 
