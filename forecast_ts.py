@@ -9,6 +9,7 @@ from darts.models import Prophet
 import holidays
 import optuna
 import logging
+from plotly.subplots import make_subplots
 
 
 
@@ -25,7 +26,7 @@ app = typer.Typer()
 
 @dataclass
 class Config:
-    steps_days: int = 7
+    steps_days: int = 60
     last_n_days_profile: int = 60
     use_crossvalidation: bool = False
     use_params_tuning: bool = False
@@ -59,7 +60,7 @@ def objective(trial, series, holidays, config):
     }
 
     model = Prophet(
-        yearly_seasonality=False,
+        yearly_seasonality=True,
         weekly_seasonality=True,
         **params
     )
@@ -162,7 +163,7 @@ def forecast_daily(series_daily, holidays_train, future_holidays, config: Config
         best_params = {}
 
     model = Prophet(
-        yearly_seasonality=False,
+        yearly_seasonality=True,
         weekly_seasonality=True,
         **best_params
     )
@@ -176,7 +177,7 @@ def forecast_daily(series_daily, holidays_train, future_holidays, config: Config
     return model.predict(
         n=config.steps_days,
         future_covariates=future_holidays
-    )
+    ), best_params
 
 
 def disaggregate_to_intraday(fcst_daily, profile, start_time, steps_days):
@@ -205,55 +206,94 @@ def disaggregate_to_intraday(fcst_daily, profile, start_time, steps_days):
 
 
     fcst_30['forecast'] = fcst_30['y_daily'] * fcst_30['share']
+    fcst_30['forecast'] = fcst_30['forecast'].clip(lower=0)
 
     return fcst_30[['dttm_30', 'forecast']]
 
 
 def get_new_year_profile(df):
 
-    df['date'] = df['dttm_30'].dt.date
-    daily = df.groupby('date')['y'].sum().reset_index()
+    df = df.copy()
+
+    df['date'] = pd.to_datetime(df['dttm_30']).dt.date
+
+    daily = (
+        df.groupby('date')['y']
+        .sum()
+        .reset_index()
+    )
+
     daily['date'] = pd.to_datetime(daily['date'])
 
     profiles = []
 
     for year in [2023, 2024, 2025]:
-        ny_range = pd.date_range(f"{year}-01-01", f"{year}-01-08")
 
-        before = daily[
+        # праздничные дни
+        ny_range = pd.date_range(
+            f"{year}-01-01",
+            f"{year}-01-08"
+        )
+
+        # обычные будни ДО нового года
+        baseline_df = daily[
             (daily['date'] >= f"{year-1}-12-15") &
             (daily['date'] < f"{year}-01-01")
-        ]['y'].mean()
+        ].copy()
 
-        after = daily[
-            (daily['date'] > f"{year}-01-08") &
-            (daily['date'] <= f"{year}-01-20")
-        ]['y'].mean()
+        # только будние
+        baseline_df = baseline_df[
+            baseline_df['date'].dt.weekday < 5
+        ]
 
-        baseline = np.mean([before, after])
+        baseline = baseline_df['y'].mean()
 
+        if pd.isna(baseline) or baseline == 0:
+            continue
+
+        # коэффициенты для каждого дня
         for d in ny_range:
+
             val = daily[daily['date'] == d]['y']
-            if len(val) > 0:
-                profiles.append({
-                    "day": d.day,
-                    "coef": val.values[0] / baseline if baseline > 0 else 1
-                })
+
+            if len(val) == 0:
+                continue
+
+            coef = val.values[0] / baseline
+
+            profiles.append({
+                "month_day": d.strftime("%m-%d"),
+                "coef": coef
+            })
 
     profile_df = pd.DataFrame(profiles)
-    return profile_df.groupby('day')['coef'].mean().to_dict()
+
+    # усредняем коэффициенты по годам
+    final_profile = (
+        profile_df
+        .groupby('month_day')['coef']
+        .mean()
+        .to_dict()
+    )
+
+    return final_profile
+
+
 
 def apply_new_year_adjustment(fcst_df, ny_profile):
 
-    fcst_df['date'] = fcst_df['dttm_30'].dt.date
+    fcst_df = fcst_df.copy()
 
-    for i, row in fcst_df.iterrows():
-        date = pd.to_datetime(row['date'])
+    fcst_df['month_day'] = (
+        pd.to_datetime(fcst_df['dttm_30'])
+        .dt.strftime("%m-%d")
+    )
 
-        if date.month == 1 and date.day in ny_profile:
-            fcst_df.loc[i, 'forecast'] *= ny_profile[date.day]
+    for md, coef in ny_profile.items():
+        mask = fcst_df['month_day'] == md
+        fcst_df.loc[mask, 'forecast'] *= coef
 
-    return fcst_df
+    return fcst_df.drop(columns=['month_day'])
 
 
 def cross_validate(series, holidays, config: Config):
@@ -270,7 +310,7 @@ def cross_validate(series, holidays, config: Config):
         holidays_val = holidays[len(train):len(train)+horizon]
 
         model = Prophet(
-            yearly_seasonality=False,
+            yearly_seasonality=True,
             weekly_seasonality=True,
             seasonality_mode='multiplicative'
         )
@@ -289,6 +329,7 @@ def cross_validate(series, holidays, config: Config):
 def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, config):
 
     results = []
+
 
     for ts_name in df['ts_name'].unique():
         logger.info(f"Processing TS: {ts_name}")
@@ -348,7 +389,7 @@ def run_forecast(df, holiday_series, get_intraday_profile, aggregate_to_daily, c
         )
 
 
-        fcst_daily = forecast_daily(
+        fcst_daily, best_params = forecast_daily(
             series_daily,
             holidays_train,
             future_holidays,
@@ -389,25 +430,83 @@ def save_plots(df, forecast_df, output_dir):
 
     for ts_name in forecast_df['ts_name'].unique():
 
+        df_hist = df[df['ts_name'] == ts_name].copy()
+        df_fcst = forecast_df[forecast_df['ts_name'] == ts_name].copy()
 
-        df_hist = df[df['ts_name'] == ts_name]
-        df_fcst = forecast_df[forecast_df['ts_name'] == ts_name]
 
-        fig = go.Figure()
 
-        fig.add_trace(go.Scatter(
-            x=df_hist["dttm_30"],
-            y=df_hist["y"],
-            name="History"
-        ))
+        hist_daily = (
+            df_hist
+            .set_index('dttm_30')
+            .resample('D')['y']
+            .sum()
+            .reset_index()
+        )
 
-        fig.add_trace(go.Scatter(
-            x=df_fcst["dttm_30"],
-            y=df_fcst["forecast"],
-            name="Forecast"
-        ))
+        fcst_daily = (
+            df_fcst
+            .set_index('dttm_30')
+            .resample('D')['forecast']
+            .sum()
+            .reset_index()
+        )
 
-        path = os.path.join(output_dir, f"forecast_plot_{ts_name}.html")
+
+        fig = make_subplots(
+            rows=2, cols=1,
+            shared_xaxes=True,
+            subplot_titles=("Intraday (30 min)", "Daily aggregation")
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_hist["dttm_30"],
+                y=df_hist["y"],
+                name="History",
+            ),
+            row=1, col=1
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=df_fcst["dttm_30"],
+                y=df_fcst["forecast"],
+                name="Forecast",
+            ),
+            row=1, col=1
+        )
+
+
+        fig.add_trace(
+            go.Scatter(
+                x=hist_daily["dttm_30"],
+                y=hist_daily["y"],
+                name="History (daily)",
+            ),
+            row=2, col=1
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=fcst_daily["dttm_30"],
+                y=fcst_daily["forecast"],
+                name="Forecast (daily)",
+            ),
+            row=2, col=1
+        )
+
+
+        forecast_start = df_fcst["dttm_30"].min()
+
+        fig.add_vline(x=forecast_start, line_dash="dash")
+
+        fig.update_layout(
+            height=800,
+            title_text=f"Forecast for {ts_name}"
+        )
+
+
+        path = os.path.join(output_dir, f"forecast_{ts_name}.html")
         fig.write_html(path)
 
         logger.info(f"Saved plot: {path}")
