@@ -284,16 +284,72 @@ def apply_new_year_adjustment(fcst_df, ny_profile):
 
     fcst_df = fcst_df.copy()
 
-    fcst_df['month_day'] = (
-        pd.to_datetime(fcst_df['dttm_30'])
-        .dt.strftime("%m-%d")
+    fcst_df['date'] = pd.to_datetime(fcst_df['dttm_30']).dt.date
+
+    # daily forecast
+    daily_fcst = (
+        fcst_df
+        .groupby('date')['forecast']
+        .sum()
+        .reset_index()
     )
 
-    for md, coef in ny_profile.items():
-        mask = fcst_df['month_day'] == md
-        fcst_df.loc[mask, 'forecast'] *= coef
+    daily_fcst['date'] = pd.to_datetime(daily_fcst['date'])
 
-    return fcst_df.drop(columns=['month_day'])
+    years = daily_fcst['date'].dt.year.unique()
+
+    for year in years:
+
+        # проверяем есть ли НГ в прогнозе
+        ny_days = pd.date_range(
+            f"{year}-01-01",
+            f"{year}-01-08"
+        )
+
+        if not daily_fcst['date'].isin(ny_days).any():
+            continue
+
+        # 2 недели до НГ
+        baseline_df = daily_fcst[
+            (daily_fcst['date'] >= f"{year-1}-12-15") &
+            (daily_fcst['date'] < f"{year}-01-01")
+        ].copy()
+
+        # только будни
+        baseline_df = baseline_df[
+            baseline_df['date'].dt.weekday < 5
+        ]
+
+        if len(baseline_df) == 0:
+            continue
+
+        X = baseline_df['forecast'].mean()
+
+
+        for d in ny_days:
+
+            md = d.strftime("%m-%d")
+
+            if md not in ny_profile:
+                continue
+
+            target_daily_value = X * ny_profile[md]
+
+            # заменяем дневной прогноз
+            mask_day = (
+                pd.to_datetime(fcst_df['dttm_30']).dt.date == d.date()
+            )
+
+            current_sum = fcst_df.loc[mask_day, 'forecast'].sum()
+
+            if current_sum <= 0:
+                continue
+
+            scale = target_daily_value / current_sum
+
+            fcst_df.loc[mask_day, 'forecast'] *= scale
+
+    return fcst_df.drop(columns=['date'])
 
 
 def cross_validate(series, holidays, config: Config):
